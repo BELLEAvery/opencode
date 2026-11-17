@@ -41,6 +41,76 @@ const it = testEffect(
 )
 
 describe("Session.revert files", () => {
+  it.live("reverts each delegated turn while keeping a direct prompt in the same child", () =>
+    Effect.gen(function* () {
+      const f = yield* setup
+      const prompt = yield* f.prompt(f.parent.id)
+      const child = yield* f.sessions.create({ parentID: f.parent.id })
+      const first = yield* f.start(f.parent.id)
+      yield* f.delegate(first, child.id)
+      yield* f.end(first)
+      const edit = yield* f.start(child.id)
+      yield* f.write("First delegated edit.\n")
+      yield* f.end(edit)
+
+      yield* f.prompt(child.id)
+      const direct = yield* f.start(child.id)
+      const keep = Bun.file(path.join(f.directory, "direct.txt"))
+      yield* Effect.promise(() => Bun.write(keep, "Direct edit.\n"))
+      yield* f.end(direct)
+
+      const next = yield* f.start(f.parent.id)
+      yield* f.delegate(next, child.id)
+      yield* f.end(next)
+      const delegated = yield* f.start(child.id)
+      const remove = Bun.file(path.join(f.directory, "delegated.txt"))
+      yield* Effect.promise(() => Bun.write(remove, "Second delegated edit.\n"))
+      yield* f.end(delegated)
+
+      const result = yield* f.sessions.revert.stage({ sessionID: f.parent.id, messageID: prompt.id })
+      expect(result.files?.map((file) => file.file).sort()).toEqual(["delegated.txt", "file.txt"])
+      expect(yield* f.read()).toBe("line 1\nline 2\n")
+      expect(yield* Effect.promise(() => keep.text())).toBe("Direct edit.\n")
+      expect(yield* Effect.promise(() => remove.exists())).toBe(false)
+    }),
+  )
+
+  it.live("preserves another child's writes between and after reverted steps on the same paths", () =>
+    Effect.gen(function* () {
+      const f = yield* setup
+      yield* f.prompt(f.parent.id)
+      const earlier = yield* f.start(f.parent.id)
+      const sibling = yield* f.sessions.create({ parentID: f.parent.id })
+      yield* f.delegate(earlier, sibling.id)
+      yield* f.end(earlier)
+
+      const prompt = yield* f.prompt(f.parent.id)
+      const parent = yield* f.start(f.parent.id)
+      const child = yield* f.sessions.create({ parentID: f.parent.id })
+      yield* f.delegate(parent, child.id)
+      yield* f.end(parent)
+      const shared = Bun.file(path.join(f.directory, "shared.txt"))
+      const first = yield* f.start(child.id)
+      yield* f.write("Child first.\n")
+      yield* Effect.promise(() => Bun.write(shared, "Child first.\n"))
+      yield* f.end(first)
+      const other = yield* f.start(sibling.id)
+      yield* f.write("Sibling result.\n")
+      yield* Effect.promise(() => Bun.write(shared, "Sibling result.\n"))
+      yield* f.end(other)
+      const second = yield* f.start(child.id)
+      yield* f.write("Child second.\n")
+      yield* f.end(second)
+
+      const result = yield* f.sessions.revert.stage({ sessionID: f.parent.id, messageID: prompt.id })
+      expect(yield* f.read()).toBe("Sibling result.\n")
+      expect(yield* Effect.promise(() => shared.text())).toBe("Sibling result.\n")
+      expect(result.files?.map((file) => file.file)).toEqual(["file.txt"])
+      yield* f.sessions.revert.clear(f.parent.id)
+      expect(yield* f.read()).toBe("Child second.\n")
+    }),
+  )
+
   it.live("undoes a background child's edit after the parent step and restores it on clear", () =>
     Effect.gen(function* () {
       const f = yield* setup
