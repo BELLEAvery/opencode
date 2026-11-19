@@ -3,6 +3,7 @@ import { describe, expect } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
 import { Effect } from "effect"
+import { eq } from "drizzle-orm"
 import { Agent } from "@opencode/core/agent"
 import { Bus } from "@opencode/core/bus"
 import { Database } from "@opencode/core/database/database"
@@ -17,6 +18,7 @@ import { SessionEvent } from "@opencode/core/session/event"
 import { SessionExecution } from "@opencode/core/session/execution"
 import { SessionInbox } from "@opencode/core/session/inbox"
 import { SessionMessage } from "@opencode/core/session/message"
+import { SessionMessageTable } from "@opencode/core/session/sql"
 import { SessionProjector } from "@opencode/core/session/projector"
 import { Snapshot } from "@opencode/core/snapshot"
 import { Money } from "@opencode/schema/money"
@@ -179,6 +181,58 @@ describe("Session.revert files", () => {
       yield* f.write("Later child edit.\n")
       yield* f.end(next)
 
+      yield* f.sessions.revert.stage({ sessionID: f.parent.id, messageID: prompt.id })
+      expect(yield* f.read()).toBe("Earlier child edit.\n")
+    }),
+  )
+
+  it.live("reverts a legacy follow-up delivered after the parent tool completed", () =>
+    Effect.gen(function* () {
+      const f = yield* setup
+      const bus = yield* Bus.Service
+      const database = yield* Database.Service
+      yield* f.prompt(f.parent.id)
+      const earlier = yield* f.start(f.parent.id)
+      const child = yield* f.sessions.create({ parentID: f.parent.id })
+      yield* f.delegate(earlier, child.id)
+      yield* f.end(earlier)
+      const first = yield* f.start(child.id)
+      yield* f.write("Earlier child edit.\n")
+      yield* f.end(first)
+
+      const prompt = yield* f.prompt(f.parent.id)
+      const parent = yield* f.start(f.parent.id)
+      const call = {
+        sessionID: f.parent.id,
+        assistantMessageID: parent.assistantMessageID,
+        id: `call-${parent.assistantMessageID}`,
+      }
+      yield* bus.publish(SessionEvent.Tool.Input.Started, { ...call, name: "subagent" })
+      yield* bus.publish(SessionEvent.Tool.Called, {
+        ...call,
+        input: { sessionID: child.id, prompt: "Update the file" },
+        executed: true,
+      })
+      const followup = yield* f.sessions.prompt({ sessionID: child.id, text: "Update the file", resume: false })
+      const completed = yield* bus.publish(SessionEvent.Tool.Success, {
+        ...call,
+        executed: true,
+        content: [{ type: "text", text: "Working in the background" }],
+        metadata: { sessionID: child.id, status: "running" },
+      })
+      yield* f.end(parent)
+      yield* SessionInbox.promote(database.db, bus, child.id, "steer")
+      const delivered = yield* database.db
+        .select({ created: SessionMessageTable.time_created })
+        .from(SessionMessageTable)
+        .where(eq(SessionMessageTable.id, followup.id))
+        .get()
+        .pipe(Effect.orDie)
+      expect(delivered?.created).toBeGreaterThanOrEqual(completed.created)
+
+      const later = yield* f.start(child.id)
+      yield* f.write("Later legacy child edit.\n")
+      yield* f.end(later)
       yield* f.sessions.revert.stage({ sessionID: f.parent.id, messageID: prompt.id })
       expect(yield* f.read()).toBe("Earlier child edit.\n")
     }),

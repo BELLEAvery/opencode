@@ -1,8 +1,10 @@
 export * as SessionRevert from "./revert.js"
 
-import { and, asc, eq, gt, gte, isNull, lt, lte, sql } from "drizzle-orm"
+import { and, asc, eq, gt, gte, inArray, isNull, lt, lte, or, sql } from "drizzle-orm"
 import { DateTime, Effect, Option, Schema } from "effect"
 import { Database } from "../database/database.js"
+import { EventTable } from "../event/sql.js"
+import { Event } from "@opencode/schema/event"
 import { Bus } from "../bus.js"
 import { Instance } from "../instance/service.js"
 import { RelativePath } from "../schema.js"
@@ -114,13 +116,27 @@ const plan = Effect.fn("SessionRevert.plan")(function* (
       const childID = Schema.decodeUnknownOption(SessionSchema.ID)(tool.state.metadata?.sessionID)
       if (Option.isNone(childID)) continue
       const promptID = Schema.decodeUnknownOption(SessionMessage.ID)(tool.state.metadata?.promptID)
-      // Legacy launches own the first prompt. For continuations, match the prompt admitted during this call.
+      // Legacy launches own the first prompt. For continuations, match the prompt enqueued during this call.
       const legacyFollowup = Option.isNone(promptID) && tool.state.input.sessionID !== undefined
       const completed = tool.time.completed
       const text = tool.state.input.prompt
       if (legacyFollowup && (!completed || typeof text !== "string")) continue
       const prompts = () => db.select({ seq: SessionMessageTable.seq }).from(SessionMessageTable)
       const inChild = and(eq(SessionMessageTable.session_id, childID.value), eq(SessionMessageTable.type, "user"))
+      const admitted = db
+        .select({ id: sql<SessionMessage.ID>`json_extract(${EventTable.data}, '$.inboxID')` })
+        .from(EventTable)
+        .where(
+          and(
+            eq(EventTable.aggregate_id, childID.value),
+            eq(
+              EventTable.type,
+              Event.versionedType(SessionEvent.InboxEnqueued.type, SessionEvent.InboxEnqueued.durable.version),
+            ),
+            gte(EventTable.created, DateTime.toEpochMillis(tool.time.ran ?? tool.time.created)),
+            completed ? lte(EventTable.created, DateTime.toEpochMillis(completed)) : undefined,
+          ),
+        )
       const [after, ambiguous] = yield* prompts()
         .where(
           and(
@@ -129,8 +145,13 @@ const plan = Effect.fn("SessionRevert.plan")(function* (
             legacyFollowup && completed
               ? and(
                   eq(sql<string>`json_extract(${SessionMessageTable.data}, '$.text')`, text),
-                  gte(SessionMessageTable.time_created, DateTime.toEpochMillis(tool.time.ran ?? tool.time.created)),
-                  lte(SessionMessageTable.time_created, DateTime.toEpochMillis(completed)),
+                  or(
+                    inArray(SessionMessageTable.id, admitted),
+                    and(
+                      gte(SessionMessageTable.time_created, DateTime.toEpochMillis(tool.time.ran ?? tool.time.created)),
+                      lte(SessionMessageTable.time_created, DateTime.toEpochMillis(completed)),
+                    ),
+                  ),
                 )
               : undefined,
           ),
